@@ -8,6 +8,8 @@ from datetime import datetime
 import json
 import os
 import base64
+import urllib.request
+import ssl
 
 st.set_page_config(
     page_title="VCP 即時看盤與突破監控",
@@ -18,6 +20,58 @@ st.set_page_config(
 # ----------------- 檔案與音效設定 -----------------
 CONFIG_FILE = "vcp_config.json"
 SOUND_FILE = "xopen.mp3"  # 世紀帝國突破音效檔
+
+# ----------------- 內建中文名稱備援表 -----------------
+DEFAULT_STOCK_NAMES = {
+    "2330": "台積電", "2454": "聯發科", "3037": "欣興", "6488": "環球晶",
+    "2308": "台達電", "2379": "瑞昱", "3234": "光環", "3581": "博磊",
+    "6274": "台燿", "2317": "鴻海", "2603": "長榮", "2609": "陽明",
+    "2615": "萬海", "2382": "廣達", "3231": "緯創", "6669": "緯穎",
+    "2356": "英業達", "2376": "技嘉", "3017": "奇鋐", "3324": "雙鴻",
+    "3443": "創意", "3661": "世芯-KY", "2449": "京元電子", "6223": "旺矽",
+    "3529": "力旺", "8069": "元太", "2409": "友達", "3481": "群創",
+    "0050": "元大台灣50", "0056": "元大高股息", "00878": "國泰永續高股息",
+    "00919": "群益台灣精選高息", "00929": "復華台灣科技優息"
+}
+
+@st.cache_data(ttl=86400)
+def get_tw_stock_names_dict():
+    """從證交所 (TWSE) 與櫃買中心 (TPEx) 官方 OpenAPI 抓取全台股中文簡稱對照表"""
+    names_dict = DEFAULT_STOCK_NAMES.copy()
+    headers = {"User-Agent": "Mozilla/5.0"}
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    # 1. 抓取上市公司基本資料
+    try:
+        req = urllib.request.Request("https://openapi.twse.com.tw/v1/opendata/t187ap03_L", headers=headers)
+        with urllib.request.urlopen(req, timeout=3, context=ctx) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            for item in data:
+                code = item.get("公司代號", "").strip()
+                name = item.get("公司簡稱", "").strip()
+                if code and name:
+                    names_dict[code] = name
+    except Exception:
+        pass
+
+    # 2. 抓取上櫃公司基本資料
+    try:
+        req = urllib.request.Request("https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O", headers=headers)
+        with urllib.request.urlopen(req, timeout=3, context=ctx) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            for item in data:
+                code = item.get("SecuritiesCompanyCode", "").strip()
+                name = item.get("CompanyAbbreviation", "").strip()
+                if code and name:
+                    names_dict[code] = name
+    except Exception:
+        pass
+
+    return names_dict
+
+stock_names_dict = get_tw_stock_names_dict()
 
 # ----------------- 檔案儲存與讀取函式 -----------------
 def load_config():
@@ -92,13 +146,15 @@ user_input = st.sidebar.text_area(
 all_symbols = [c.strip() for c in user_input.replace("\n", ",").split(",") if c.strip()]
 active_symbols = all_symbols[:current_grid["max_stocks"]]
 
-# 突破價位設定
+# 突破價位設定（帶中文名稱）
 st.sidebar.subheader("🔔 向上突破關鍵點位")
 temp_alert_prices = {}
 for sym in active_symbols:
+    c_name = stock_names_dict.get(sym, "")
+    display_label = f"{sym} {c_name}".strip()
     default_price = float(cfg.get("alert_prices", {}).get(sym, 0.0))
     val = st.sidebar.number_input(
-        f"{sym} 關鍵價 (0為不啟用)",
+        f"{display_label} 關鍵價 (0為不啟用)",
         min_value=0.0,
         value=default_price,
         step=0.5,
@@ -135,22 +191,58 @@ else:
 refresh_sec = st.sidebar.selectbox("即時更新頻率", options=[3, 5, 10, 30], index=1, format_func=lambda x: f"{x} 秒")
 lookback_days = st.sidebar.slider("日 K 顯示長度", min_value=30, max_value=90, value=cfg.get("lookback_days", 50))
 
-# ----------------- 通知與音效觸發組件 -----------------
+# ----------------- 通知與音效觸發組件 (限制 5 秒) -----------------
 def trigger_alert_system(alert_items):
-    msg_list = [f"{item['symbol']} 向上突破 {item['target']:.2f} (現價: {item['price']:.2f})" for item in alert_items]
+    msg_list = [
+        f"{item['symbol']} {item.get('name', '')} 向上突破 {item['target']:.2f} (現價: {item['price']:.2f})".strip()
+        for item in alert_items
+    ]
     alert_text = "\\n".join(msg_list)
 
     audio_data_url = get_audio_base64(SOUND_FILE)
 
     if audio_data_url:
-        # 播放指定的 xopen.mp3 音效
         audio_js = f"""
+        // 1. 若有上一段正在播放的音效，立刻強制停止
+        try {{
+            if (window.parent && window.parent.__vcp_audio_inst) {{
+                window.parent.__vcp_audio_inst.pause();
+                window.parent.__vcp_audio_inst.currentTime = 0;
+            }}
+        }} catch(e) {{}}
+
         const audio = new Audio("{audio_data_url}");
         audio.volume = 0.95;
+
+        // 存入 window.parent 防止重複疊加
+        try {{
+            if (window.parent) {{
+                window.parent.__vcp_audio_inst = audio;
+            }}
+        }} catch(e) {{}}
+
+        // 2. 嚴格限時 5 秒機制 (雙保險：timeupdate 監聽 + setTimeout 計時器)
+        const stopAudioStrictly = () => {{
+            try {{
+                audio.pause();
+                audio.currentTime = 0;
+            }} catch(e) {{}}
+        }};
+
+        // 保險一：超過 5 秒直接關閉
+        setTimeout(stopAudioStrictly, 5000);
+
+        // 保險二：依播放進度時間戳監控，達到 5.0 秒立刻停
+        audio.ontimeupdate = function() {{
+            if (this.currentTime >= 5.0) {{
+                stopAudioStrictly();
+            }}
+        }};
+
         audio.play().catch(e => console.log("Audio blocked:", e));
         """
     else:
-        # 備援機制：若找不到 xopen.mp3 檔案，使用預設合成雙音階嗶聲
+        # 備援嗶聲
         audio_js = """
         const ctx = new (window.AudioContext || window.webkitAudioContext)();
         function playTone(freq, delay, duration) {
@@ -197,8 +289,8 @@ def trigger_alert_system(alert_items):
     components.html(js_code, height=0, width=0)
 
 if st.session_state.test_alert:
-    trigger_alert_system([{"symbol": "測試突破", "target": 100.0, "price": 105.0}])
-    st.toast("🔊 正在播放 xopen.mp3 測試音效！", icon="⚔️")
+    trigger_alert_system([{"symbol": "2330", "name": "台積電", "target": 1000.0, "price": 1005.0}])
+    st.toast("🔊 正在播放測試音效（嚴格限制 5 秒切斷）！", icon="⚔️")
 
 # ----------------- 資料抓取核心 -----------------
 @st.cache_data(ttl=86400)
@@ -352,12 +444,14 @@ def render_dashboard():
     for idx, sym in enumerate(active_symbols):
         col = cols[idx % num_cols]
         target_p = temp_alert_prices.get(sym, 0.0)
+        c_name = stock_names_dict.get(sym, "")
+        display_title = f"{sym} {c_name}".strip()
 
         with col:
             with st.container(border=True):
                 data = fetch_live_vcp_data(sym, lookback_days)
                 if not data:
-                    st.warning(f"代號 {sym} 讀取中...")
+                    st.warning(f"{display_title} 讀取中...")
                     continue
 
                 curr_p = data["curr_price"]
@@ -366,12 +460,12 @@ def render_dashboard():
                 if target_p > 0:
                     if curr_p >= target_p and sym not in st.session_state.triggered_alerts:
                         st.session_state.triggered_alerts.add(sym)
-                        new_alerts.append({"symbol": sym, "target": target_p, "price": curr_p})
+                        new_alerts.append({"symbol": sym, "name": c_name, "target": target_p, "price": curr_p})
 
-                c1, c2 = st.columns([1, 1])
+                c1, c2 = st.columns([1.2, 1])
                 with c1:
                     alert_status = " 🚀" if sym in st.session_state.triggered_alerts else ""
-                    st.markdown(f"**{sym}**{alert_status}")
+                    st.markdown(f"**{display_title}**{alert_status}")
                 with c2:
                     st.metric(
                         label="現價",
@@ -386,6 +480,7 @@ def render_dashboard():
     if new_alerts:
         trigger_alert_system(new_alerts)
         for a in new_alerts:
-            st.toast(f"🚀 {a['symbol']} 向上突破關鍵價 {a['target']:.2f}！現價 {a['price']:.2f}", icon="⚔️")
+            name_part = f" {a['name']}" if a.get('name') else ""
+            st.toast(f"🚀 {a['symbol']}{name_part} 向上突破關鍵價 {a['target']:.2f}！現價 {a['price']:.2f}", icon="⚔️")
 
 render_dashboard()
