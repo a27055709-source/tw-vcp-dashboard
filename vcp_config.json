@@ -1,0 +1,11 @@
+{
+  "symbols_str": "6196, 3105, 6691\n",
+  "grid_option": "9 檔 (3x3)",
+  "alert_prices": {
+    "6196": 540.0,
+    "3105": 500.0,
+    "6691": 650.0
+  },
+  "refresh_sec": 5,
+  "lookback_days": 50
+}

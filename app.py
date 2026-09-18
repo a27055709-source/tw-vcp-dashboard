@@ -7,6 +7,7 @@ import pandas as pd
 from datetime import datetime
 import json
 import os
+import base64
 
 st.set_page_config(
     page_title="VCP 即時看盤與突破監控",
@@ -14,7 +15,9 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# ----------------- 檔案與音效設定 -----------------
 CONFIG_FILE = "vcp_config.json"
+SOUND_FILE = "xopen.mp3"  # 世紀帝國突破音效檔
 
 # ----------------- 檔案儲存與讀取函式 -----------------
 def load_config():
@@ -39,8 +42,18 @@ def save_config(cfg):
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
         return True
-    except Exception as e:
+    except Exception:
         return False
+
+def get_audio_base64(file_path):
+    """將本地音檔轉為 Base64 字串，確保在瀏覽器與雲端皆能順利播放"""
+    if os.path.exists(file_path):
+        with open(file_path, "rb") as f:
+            data = f.read()
+        ext = file_path.split(".")[-1].lower()
+        mime = "audio/wav" if ext == "wav" else "audio/mpeg"
+        return f"data:{mime};base64,{base64.b64encode(data).decode()}"
+    return None
 
 # ----------------- 初始化狀態 -----------------
 if "config" not in st.session_state:
@@ -94,7 +107,7 @@ for sym in active_symbols:
     )
     temp_alert_prices[sym] = val
 
-# ----------------- 儲存按鈕（關鍵：保存至檔案） -----------------
+# 儲存與重設按鈕
 c_btn1, c_btn2 = st.sidebar.columns(2)
 with c_btn1:
     if st.button("💾 儲存目前設定", use_container_width=True):
@@ -113,7 +126,7 @@ with c_btn2:
         st.session_state.triggered_alerts.clear()
         st.sidebar.info("警報狀態已清空！")
 
-# 測試音效按鈕
+# 試聽音效按鈕
 if st.sidebar.button("🔊 試聽通知與測試推播", use_container_width=True):
     st.session_state.test_alert = True
 else:
@@ -127,13 +140,21 @@ def trigger_alert_system(alert_items):
     msg_list = [f"{item['symbol']} 向上突破 {item['target']:.2f} (現價: {item['price']:.2f})" for item in alert_items]
     alert_text = "\\n".join(msg_list)
 
-    js_code = f"""
-    <script>
-    try {{
-        const AudioContext = window.AudioContext || window.webkitAudioContext;
-        const ctx = new AudioContext();
-        function playTone(freq, delay, duration) {{
-            setTimeout(() => {{
+    audio_data_url = get_audio_base64(SOUND_FILE)
+
+    if audio_data_url:
+        # 播放指定的 xopen.mp3 音效
+        audio_js = f"""
+        const audio = new Audio("{audio_data_url}");
+        audio.volume = 0.95;
+        audio.play().catch(e => console.log("Audio blocked:", e));
+        """
+    else:
+        # 備援機制：若找不到 xopen.mp3 檔案，使用預設合成雙音階嗶聲
+        audio_js = """
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        function playTone(freq, delay, duration) {
+            setTimeout(() => {
                 const osc = ctx.createOscillator();
                 const gain = ctx.createGain();
                 osc.type = "sine";
@@ -143,10 +164,16 @@ def trigger_alert_system(alert_items):
                 gain.connect(ctx.destination);
                 osc.start();
                 osc.stop(ctx.currentTime + duration);
-            }}, delay);
-        }}
+            }, delay);
+        }
         playTone(587.33, 0, 0.15);
         playTone(880.00, 160, 0.3);
+        """
+
+    js_code = f"""
+    <script>
+    try {{
+        {audio_js}
     }} catch(e) {{
         console.log("Audio play error:", e);
     }}
@@ -170,8 +197,8 @@ def trigger_alert_system(alert_items):
     components.html(js_code, height=0, width=0)
 
 if st.session_state.test_alert:
-    trigger_alert_system([{"symbol": "測試股票", "target": 100.0, "price": 105.0}])
-    st.toast("🔊 正在播放測試音效！", icon="🔔")
+    trigger_alert_system([{"symbol": "測試突破", "target": 100.0, "price": 105.0}])
+    st.toast("🔊 正在播放 xopen.mp3 測試音效！", icon="⚔️")
 
 # ----------------- 資料抓取核心 -----------------
 @st.cache_data(ttl=86400)
@@ -359,6 +386,6 @@ def render_dashboard():
     if new_alerts:
         trigger_alert_system(new_alerts)
         for a in new_alerts:
-            st.toast(f"🚀 {a['symbol']} 向上突破關鍵價 {a['target']:.2f}！現價 {a['price']:.2f}", icon="🚨")
+            st.toast(f"🚀 {a['symbol']} 向上突破關鍵價 {a['target']:.2f}！現價 {a['price']:.2f}", icon="⚔️")
 
 render_dashboard()
